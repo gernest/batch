@@ -153,8 +153,8 @@ func (b *Batch) shardWidth() uint64 {
 type Fragments map[FragmentKey]map[string]*roaring.Bitmap
 
 type FragmentKey struct {
-	shard uint64
-	field uint64
+	Shard uint64
+	Field uint64
 }
 
 func (f Fragments) GetOrCreate(shard uint64, field uint64, view string) *roaring.Bitmap {
