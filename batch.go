@@ -1,21 +1,29 @@
 package batch
 
 import (
+	"cmp"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gernest/rbf/quantum"
 	"github.com/gernest/roaring"
 	"github.com/gernest/roaring/shardwidth"
+	"github.com/pkg/errors"
 )
 
 const (
-	Exists = nilSentinel
+	Exists  = nilSentinel
+	Quantum = quantum.TimeQuantum("YMDH")
+)
+
+const (
+	Timestamp uint64 = iota
+	Labels
 )
 
 const nilSentinel = ^uint64(0)
-
-type Row struct {
-	ID      uint64
-	Columns []uint64
-	Values  [][]byte
-}
 
 type Translator interface {
 	Translate(column uint64, value []byte) uint64
@@ -23,28 +31,29 @@ type Translator interface {
 
 type Batch struct {
 	ids       []uint64
-	rowIDs    map[int][]uint64
-	columns   []uint64
+	ts        []uint64
+	labels    [][]uint64
 	translate Translator
 	frags     Fragments
-	rowIDSets map[uint64][][]uint64
+	times     []*QuantizedTime
 }
 
 func New() *Batch {
 	return &Batch{
-		rowIDs:    make(map[int][]uint64),
-		frags:     make(Fragments),
-		rowIDSets: make(map[uint64][][]uint64),
+		frags: make(Fragments),
 	}
 }
 
 func (b *Batch) Reset() {
 	b.frags = make(Fragments)
 	b.ids = b.ids[:0]
-	clear(b.rowIDs)
-	clear(b.rowIDSets)
-	b.columns = b.columns[:0]
-	b.translate = nil
+	b.ts = b.ts[:0]
+	b.labels = b.labels[:0]
+	for _, t := range b.times {
+		t.Release()
+	}
+	clear(b.times)
+	b.times = b.times[:0]
 }
 
 func (b *Batch) WithTranslator(t Translator) *Batch {
@@ -52,31 +61,44 @@ func (b *Batch) WithTranslator(t Translator) *Batch {
 	return b
 }
 
-func (b *Batch) WithColumns(cols []uint64) *Batch {
-	b.columns = append(b.columns[:0], cols...)
-	return b
-}
-
-func (b *Batch) Add(record *Row) {
-	b.ids = append(b.ids, record.ID)
-	curPos := len(b.ids) - 1
-	for i := range record.Values {
-		for len(b.rowIDs[i]) < curPos {
-			b.rowIDs[i] = append(b.rowIDs[i], nilSentinel)
-		}
-		rowIDs := b.rowIDs[i]
-		rowID := b.translate.Translate(record.Columns[i], record.Values[i])
-		b.rowIDs[i] = append(rowIDs, rowID)
+func (b *Batch) addTs(ts time.Time) {
+	for len(b.ts) < len(b.ids)-1 {
+		b.ts = append(b.ts, nilSentinel)
 	}
+	q := NeqQuantumTime()
+	q.Set(ts)
+	b.times = append(b.times, q)
+	b.ts = append(b.ts, uint64(ts.UnixMilli()))
 }
 
-func (b *Batch) Build() Fragments {
-	o := b.makeFragments()
+func (b *Batch) addLabels(val [][]byte) {
+	rowIDs := make([]uint64, 0, len(val))
+	for _, k := range val {
+		if len(k) == 0 {
+			continue
+		}
+		rowID := b.translate.Translate(0, k)
+		rowIDs = append(rowIDs, rowID)
+	}
+	b.labels = append(b.labels, rowIDs)
+}
+
+func (b *Batch) Add(id uint64, ts time.Time, labels [][]byte) {
+	b.ids = append(b.ids, id)
+	b.addTs(ts)
+	b.addLabels(labels)
+}
+
+func (b *Batch) Build() (Fragments, error) {
+	o, err := b.makeFragments()
+	if err != nil {
+		return nil, err
+	}
 	b.frags = make(Fragments)
-	return o
+	return o, nil
 }
 
-func (b *Batch) makeFragments() Fragments {
+func (b *Batch) makeFragments() (Fragments, error) {
 	shardWidth := b.shardWidth()
 
 	// create _exists fragments
@@ -90,60 +112,42 @@ func (b *Batch) makeFragments() Fragments {
 		curBM.DirectAdd(col % shardWidth)
 	}
 
-	for i, rowIDs := range b.rowIDs {
+	curShard = ^uint64(0) // impossible sentinel value for shard.
+	for j := range b.ids {
+		col := b.ids[j]
+		row := b.ts[j]
+		if col/shardWidth != curShard {
+			curShard = col / shardWidth
+		}
+		if row != nilSentinel {
+			views, err := b.times[j].Views(Quantum)
+			if err != nil {
+				return nil, errors.Wrap(err, "calculating views")
+			}
+			for _, view := range views {
+				tbm := b.frags.GetOrCreate(curShard, Timestamp, view)
+				tbm.DirectAdd(row*shardWidth + (col % shardWidth))
+			}
+		}
+	}
+
+	rowIDSets := b.labels
+	curShard = ^uint64(0) // impossible sentinel value for shard.
+	curBM = nil
+	for j := range b.ids {
+		col, rowIDs := b.ids[j], rowIDSets[j]
+		if col/shardWidth != curShard {
+			curShard = col / shardWidth
+			curBM = b.frags.GetOrCreate(curShard, Labels, "")
+		}
 		if len(rowIDs) == 0 {
-			continue // this can happen when the values that came in for this field were string slices
-		}
-		curShard := ^uint64(0) // impossible sentinel value for shard.
-		var curBM *roaring.Bitmap
-		for j := range b.ids {
-			col := b.ids[j]
-			row := nilSentinel
-			if len(rowIDs) > j {
-				// this is to protect against what i believe is a bug in the idk.DeleteSentinel logic in handling nil entries
-				// this will prevent a crash by assuming missing entries are nil entries which i think is ok
-				// TODO (twg) find where the nil entry was not added on the idk side ~ingest.go batchFromSchema method
-				row = rowIDs[j]
-			}
-
-			if col/shardWidth != curShard {
-				curShard = col / shardWidth
-				// the API treats "" as standard
-				curBM = b.frags.GetOrCreate(curShard, b.columns[i], "")
-			}
-			if row != nilSentinel {
-				curBM.DirectAdd(row*shardWidth + (col % shardWidth))
-			}
-		}
-	}
-
-	for field, rowIDSets := range b.rowIDSets {
-		if len(rowIDSets) == 0 {
 			continue
-		} else if len(rowIDSets) < len(b.ids) {
-			// rowIDSets is guaranteed to have capacity == to b.ids,
-			// but if the last record had a nil for this field, it
-			// might not have the same length, so we re-slice it to
-			// ensure the lengths are the same.
-			rowIDSets = rowIDSets[:len(b.ids)]
 		}
-		curShard := ^uint64(0) // impossible sentinel value for shard.
-		var curBM *roaring.Bitmap
-		for j := range b.ids {
-			col, rowIDs := b.ids[j], rowIDSets[j]
-			if col/shardWidth != curShard {
-				curShard = col / shardWidth
-				curBM = b.frags.GetOrCreate(curShard, field, "")
-			}
-			if len(rowIDs) == 0 {
-				continue
-			}
-			for _, row := range rowIDs {
-				curBM.DirectAdd(row*shardWidth + (col % shardWidth))
-			}
+		for _, row := range rowIDs {
+			curBM.DirectAdd(row*shardWidth + (col % shardWidth))
 		}
 	}
-	return b.frags
+	return b.frags, nil
 }
 
 func (b *Batch) shardWidth() uint64 {
@@ -152,9 +156,36 @@ func (b *Batch) shardWidth() uint64 {
 
 type Fragments map[FragmentKey]map[string]*roaring.Bitmap
 
+func (f Fragments) String() string {
+	keys := make([]FragmentKey, 0, len(f))
+	for k := range f {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].Compare(&keys[j]) == -1
+	})
+	var b strings.Builder
+	for i := range keys {
+		k := keys[i]
+		v := f[k]
+		for view, r := range v {
+			fmt.Fprintf(&b, "%d:%d:%s => %v\n", k.Field, k.Shard, view, r)
+		}
+	}
+	return b.String()
+}
+
 type FragmentKey struct {
 	Shard uint64
 	Field uint64
+}
+
+func (f *FragmentKey) Compare(o *FragmentKey) int {
+	n := cmp.Compare(f.Field, o.Field)
+	if n == 0 {
+		return cmp.Compare(f.Shard, o.Shard)
+	}
+	return n
 }
 
 func (f Fragments) GetOrCreate(shard uint64, field uint64, view string) *roaring.Bitmap {
