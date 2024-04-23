@@ -94,41 +94,33 @@ func (b *Batch) Build() (Fragments, error) {
 
 func (b *Batch) makeFragments() (Fragments, error) {
 	shardWidth := b.shardWidth()
-	curShard := ^uint64(0) // impossible sentinel value for shard.
+	tsShard := ^uint64(0) // impossible sentinel value for shard.
+
+	rowIDSets := b.labels
+	labelShard := ^uint64(0) // impossible sentinel value for shard.
+
 	for j := range b.ids {
-		col := b.ids[j]
+		tsCol := b.ids[j]
 		row := b.ts[j]
-		if col/shardWidth != curShard {
-			curShard = col / shardWidth
+		if tsCol/shardWidth != tsShard {
+			tsShard = tsCol / shardWidth
 		}
+
+		labelCol, rowIDs := b.ids[j], rowIDSets[j]
+		if labelCol/shardWidth != labelShard {
+			labelShard = labelCol / shardWidth
+		}
+
 		views, err := b.times[j].Views(Quantum)
 		if err != nil {
 			return nil, errors.Wrap(err, "calculating views")
 		}
 		for _, view := range views {
-			tbm := b.frags.GetOrCreate(curShard, Timestamp, view)
-			tbm.DirectAdd(row*shardWidth + (col % shardWidth))
-		}
-	}
-
-	rowIDSets := b.labels
-	curShard = ^uint64(0) // impossible sentinel value for shard.
-	for j := range b.ids {
-		col, rowIDs := b.ids[j], rowIDSets[j]
-		if col/shardWidth != curShard {
-			curShard = col / shardWidth
-		}
-		if len(rowIDs) == 0 {
-			continue
-		}
-		for _, row := range rowIDs {
-			views, err := b.times[j].Views(Quantum)
-			if err != nil {
-				return nil, errors.Wrap(err, "calculating views")
-			}
-			for _, view := range views {
-				tbm := b.frags.GetOrCreate(curShard, Labels, view)
-				tbm.DirectAdd(row*shardWidth + (col % shardWidth))
+			b.frags.GetOrCreate(tsShard, Timestamp, view).
+				DirectAdd(row*shardWidth + (tsCol % shardWidth))
+			for _, labelRow := range rowIDs {
+				b.frags.GetOrCreate(labelShard, Labels, view).
+					DirectAdd(labelRow*shardWidth + (labelCol % shardWidth))
 			}
 		}
 	}
@@ -150,10 +142,17 @@ func (f Fragments) String() string {
 		return keys[i].Compare(&keys[j]) == -1
 	})
 	var b strings.Builder
+	var ls []string
 	for i := range keys {
 		k := keys[i]
 		v := f[k]
-		for view, r := range v {
+		ls = ls[:0]
+		for view := range v {
+			ls = append(ls, view)
+		}
+		sort.Strings(ls)
+		for _, view := range ls {
+			r := v[view]
 			fmt.Fprintf(&b, "%d:%d:%s => %v\n", k.Field, k.Shard, view, r)
 		}
 	}
