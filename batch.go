@@ -14,7 +14,6 @@ import (
 )
 
 const (
-	Exists  = nilSentinel
 	Quantum = quantum.TimeQuantum("YMDH")
 )
 
@@ -22,8 +21,6 @@ const (
 	Timestamp uint64 = iota
 	Labels
 )
-
-const nilSentinel = ^uint64(0)
 
 type Translator interface {
 	Translate(column uint64, value []byte) uint64
@@ -62,9 +59,6 @@ func (b *Batch) WithTranslator(t Translator) *Batch {
 }
 
 func (b *Batch) addTs(ts time.Time) {
-	for len(b.ts) < len(b.ids)-1 {
-		b.ts = append(b.ts, nilSentinel)
-	}
 	q := NeqQuantumTime()
 	q.Set(ts)
 	b.times = append(b.times, q)
@@ -100,51 +94,42 @@ func (b *Batch) Build() (Fragments, error) {
 
 func (b *Batch) makeFragments() (Fragments, error) {
 	shardWidth := b.shardWidth()
-
-	// create _exists fragments
-	var curBM *roaring.Bitmap
 	curShard := ^uint64(0) // impossible sentinel value for shard.
-	for _, col := range b.ids {
-		if col/shardWidth != curShard {
-			curShard = col / shardWidth
-			curBM = b.frags.GetOrCreate(curShard, Exists, "")
-		}
-		curBM.DirectAdd(col % shardWidth)
-	}
-
-	curShard = ^uint64(0) // impossible sentinel value for shard.
 	for j := range b.ids {
 		col := b.ids[j]
 		row := b.ts[j]
 		if col/shardWidth != curShard {
 			curShard = col / shardWidth
 		}
-		if row != nilSentinel {
-			views, err := b.times[j].Views(Quantum)
-			if err != nil {
-				return nil, errors.Wrap(err, "calculating views")
-			}
-			for _, view := range views {
-				tbm := b.frags.GetOrCreate(curShard, Timestamp, view)
-				tbm.DirectAdd(row*shardWidth + (col % shardWidth))
-			}
+		views, err := b.times[j].Views(Quantum)
+		if err != nil {
+			return nil, errors.Wrap(err, "calculating views")
+		}
+		for _, view := range views {
+			tbm := b.frags.GetOrCreate(curShard, Timestamp, view)
+			tbm.DirectAdd(row*shardWidth + (col % shardWidth))
 		}
 	}
 
 	rowIDSets := b.labels
 	curShard = ^uint64(0) // impossible sentinel value for shard.
-	curBM = nil
 	for j := range b.ids {
 		col, rowIDs := b.ids[j], rowIDSets[j]
 		if col/shardWidth != curShard {
 			curShard = col / shardWidth
-			curBM = b.frags.GetOrCreate(curShard, Labels, "")
 		}
 		if len(rowIDs) == 0 {
 			continue
 		}
 		for _, row := range rowIDs {
-			curBM.DirectAdd(row*shardWidth + (col % shardWidth))
+			views, err := b.times[j].Views(Quantum)
+			if err != nil {
+				return nil, errors.Wrap(err, "calculating views")
+			}
+			for _, view := range views {
+				tbm := b.frags.GetOrCreate(curShard, Labels, view)
+				tbm.DirectAdd(row*shardWidth + (col % shardWidth))
+			}
 		}
 	}
 	return b.frags, nil

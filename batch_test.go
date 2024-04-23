@@ -2,6 +2,7 @@ package batch
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -20,14 +21,14 @@ func TestBatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := `0:0:2006 => c(1191406982922240012)
-0:0:200601 => c(1191406982922240012)
-0:0:20060102 => c(1191406982922240012)
-0:0:2006010215 => c(1191406982922240012)
-1:0: => c(1048588, 2097164)
-18446744073709551615:0: => c(12)
-`
 		got := f.String()
+
+		// os.WriteFile("testdata/batch.txt", []byte(got), 0600)
+		w, err := os.ReadFile("testdata/batch.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := string(w)
 		if want != got {
 			t.Errorf("expected =>\n%s \ngot=> %v", want, got)
 		}
