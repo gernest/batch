@@ -16,7 +16,9 @@ func TestBatch(t *testing.T) {
 		b.Add(12, now, [][]byte{
 			[]byte("hello"),
 			[]byte("world"),
-		})
+		},
+			1.0,
+		)
 		f, err := b.Build()
 		if err != nil {
 			t.Fatal(err)

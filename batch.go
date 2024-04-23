@@ -3,6 +3,7 @@ package batch
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ const (
 const (
 	Timestamp uint64 = iota
 	Labels
+	Value
 )
 
 type Translator interface {
@@ -30,6 +32,7 @@ type Batch struct {
 	ids       []uint64
 	ts        []uint64
 	labels    [][]uint64
+	value     []uint64
 	translate Translator
 	frags     Fragments
 	times     []*QuantizedTime
@@ -77,10 +80,11 @@ func (b *Batch) addLabels(val [][]byte) {
 	b.labels = append(b.labels, rowIDs)
 }
 
-func (b *Batch) Add(id uint64, ts time.Time, labels [][]byte) {
+func (b *Batch) Add(id uint64, ts time.Time, labels [][]byte, value float64) {
 	b.ids = append(b.ids, id)
 	b.addTs(ts)
 	b.addLabels(labels)
+	b.value = append(b.value, math.Float64bits(value))
 }
 
 func (b *Batch) Build() (Fragments, error) {
@@ -101,7 +105,6 @@ func (b *Batch) makeFragments() (Fragments, error) {
 
 	for j := range b.ids {
 		tsCol := b.ids[j]
-		row := b.ts[j]
 		if tsCol/shardWidth != tsShard {
 			tsShard = tsCol / shardWidth
 		}
@@ -117,7 +120,9 @@ func (b *Batch) makeFragments() (Fragments, error) {
 		}
 		for _, view := range views {
 			b.frags.GetOrCreate(tsShard, Timestamp, view).
-				DirectAdd(row*shardWidth + (tsCol % shardWidth))
+				DirectAdd(b.ts[j]*shardWidth + (tsCol % shardWidth))
+			b.frags.GetOrCreate(tsShard, Value, view).
+				DirectAdd(b.value[j]*shardWidth + (tsCol % shardWidth))
 			for _, labelRow := range rowIDs {
 				b.frags.GetOrCreate(labelShard, Labels, view).
 					DirectAdd(labelRow*shardWidth + (labelCol % shardWidth))
