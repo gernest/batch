@@ -48,6 +48,7 @@ func (b *Batch) Reset() {
 	b.frags = make(Fragments)
 	b.ids = b.ids[:0]
 	b.ts = b.ts[:0]
+	b.value = b.value[:0]
 	b.labels = b.labels[:0]
 	for _, t := range b.times {
 		t.Release()
